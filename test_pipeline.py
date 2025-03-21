@@ -1,26 +1,68 @@
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
-import traceback
-import docker
+import datetime
+import logging
+import re
+import threading
 
-from token_count import TokenCounter
 from OAI import FlowControlOpenAIClient
 from utils import get_code_from_md_code_block, get_test_status_from_stdout
+
+# 清理 ANSI 转义字符
+def _clean_ansi(text):
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
+# 配置日志
+def setup_logger(project_name):
+    """为每个项目创建独立的 logger 实例"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = f"logs/{project_name}_{timestamp}.log"
+
+    # 确保日志目录存在
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    # 创建 logger 实例（不共享）
+    logger = logging.getLogger(project_name)  # 以项目名称命名，保证唯一
+    logger.setLevel(logging.INFO)  # 设置日志级别
+
+    # 防止重复添加 handler
+    if not logger.handlers:
+        # 创建文件 handler
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+
+        # 创建控制台 handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+
+        # 绑定 handler
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
+    return logger
+
+
 class Task:
-    def __init__(self, project_path, base_url, api_key, model="gpt-4", tpm_limit=90000, rpm_limit=300):
+    def __init__(self, project_path, base_url, api_key, model="gpt-4", tpm_limit=90000, rpm_limit=300, project_name="default"):
         self.project_path = project_path
         self.temp_path = tempfile.mkdtemp()
-        self.docker_client = docker.from_env()
-        self.model=model
-        self.client=FlowControlOpenAIClient(model=model, tpm_limit=tpm_limit, rpm_limit=rpm_limit, base_url=base_url, api_key=api_key)
+        self.model = model
+        self.client = FlowControlOpenAIClient(model=model, tpm_limit=tpm_limit, rpm_limit=rpm_limit,
+                                               base_url=base_url, api_key=api_key)
         self.test_files_path = None
         self.results = []
+        self.output_lines = []
+        self.logger = setup_logger(project_name)  # 每个任务创建独立的 logger
+
     def copy_project_to_temp(self):
         try:
             shutil.copytree(self.project_path, self.temp_path, dirs_exist_ok=True)
         except Exception as e:
-            print(f"Failed to copy project to temp directory: {e}")
+            self.logger.error(f"Failed to copy project to temp directory: {e}")
             raise
 
     def clear_test_files(self):
@@ -29,10 +71,10 @@ class Task:
                 if ('test' in file.lower()) or ('spec' in file.lower()):
                     test_file_path = os.path.join(root, file)
                     try:
-                        open(test_file_path, 'w').close()  # Empty the content of the test file
+                        open(test_file_path, 'w').close()  # 清空测试文件内容
                         self.test_files_path = test_file_path
                     except Exception as e:
-                        print(f"Failed to clear test file {file}: {e}")
+                        self.logger.error(f"Failed to clear test file {file}: {e}")
                         raise
 
     def get_directory_tree(self, directory=None):
@@ -45,177 +87,184 @@ class Task:
             tree_structure += f'{indent}{os.path.basename(root)}/\n'
             sub_indent = ' ' * 4 * (level + 1)
             for f in files:
-                tree_structure += f'{sub_indent}{f}\n'
+                full_path = os.path.join(root, f)
                 try:
-                    with open(os.path.join(root, f), 'r') as file:
-                        content = file.read()
-                        if content=="":
-                            content="<UNDONE>"
+                    with open(full_path, 'r') as file_obj:
+                        content = file_obj.read()
+                        if content == "":
+                            content = "<UNDONE>"
                         tree_structure += f'{sub_indent}    Content: {content}\n'
-                except:
+                except Exception:
                     tree_structure += f'{sub_indent}    Content: <Unable to read>\n'
         return tree_structure
 
     def call_ai_to_complete_tests(self):
-
         directory_tree = self.get_directory_tree()
-        print("Directory Tree:", directory_tree)
+        self.logger.info("Directory Tree:\n" + directory_tree)
         try:
             response = self.client.call_openai_api(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": "The following is the directory structure of a project with a missing unit test. Please complete a centain unit test file based on the content user provided. Only return pure code, no comments or explanations are needed. **DO NOT** use markdown code blocks(``` ```)."},
-                    {"role": "user", "content": f"'''{directory_tree}''' \n the unit tests files {self.test_files_path} need to be completed."}
-                ],
-                stream=False
+                messages=[{
+                    "role": "system", 
+                    "content": "The following is the directory structure of a project with a missing unit test. Please complete a certain unit test file based on the content user provided. **Only** use dependencies declared in package/requirement file already. Only return pure code, no comments or explanations are needed. **DO NOT** use markdown code blocks(``` ```)."
+                },
+                {
+                    "role": "user", 
+                    "content": f"'''{directory_tree}''' \n the unit tests files {self.test_files_path} need to be completed."
+                }], stream=False
             )
             return response.choices[0].message.content
         except Exception as e:
-            print(f"Failed to call AI API to complete tests: {e}")
+            self.logger.error(f"Failed to call AI API to complete tests: {e}")
             raise
 
     def write_completed_tests(self, ai_generated_tests):
         cleaned = get_code_from_md_code_block(ai_generated_tests)
-        print("AI Generated Tests:", cleaned)
-        # Write the AI-generated code back to the test files
-        # (Assuming it contains instructions to write to specific files)
-        # This part can be made more sophisticated depending on AI's response structure
-        test_files = [os.path.join(root, file) for root, _, files in os.walk(self.temp_path) for file in files if ('test' in file.lower()) or ('spec' in file.lower())]
-        if len(test_files) == 0:
+        self.logger.info("AI Generated Tests:\n" + cleaned)
+        test_files = [os.path.join(root, file) for root, _, files in os.walk(self.temp_path)
+                      for file in files if ('test' in file.lower()) or ('spec' in file.lower())]
+        if not test_files:
             raise Exception("No test files found to update.")
         try:
             with open(test_files[0], 'w') as test_file:
                 test_file.write(cleaned)
         except Exception as e:
-            print(f"Failed to write completed tests to file: {e}")
-            raise
-
-    def docker_run_and_get_output(self):
-        try:
-            container = self.docker_client.containers.run(
-                image=self.build_docker_image(),
-                detach=True,
-                auto_remove=False  # 改为False以便查看日志
-            )
-            
-            # 等待容器结束
-            container.wait()
-            
-            # 获取所有日志
-            output = container.logs(stdout=True, stderr=True).decode('utf-8')
-            print("Container output:", output)  # 添加日志打印
-            
-            # 清理容器
-            container.remove()
-            
-            return output
-        except docker.errors.DockerException as e:
-            print(f"Docker run failed: {e}")
+            self.logger.error(f"Failed to write completed tests to file: {e}")
             raise
 
     def build_docker_image(self):
         try:
-            print("\n=== 开始构建 Docker 镜像 ===")
-            print(f"构建路径: {self.temp_path}")
-            
-            # 检查 Dockerfile 是否存在
+            self.logger.info("\n=== 开始构建 Docker 镜像 ===")
+            self.logger.info(f"构建路径: {self.temp_path}")
             dockerfile_path = os.path.join(self.temp_path, 'Dockerfile')
             if not os.path.exists(dockerfile_path):
                 raise FileNotFoundError(f"Dockerfile not found at {dockerfile_path}")
-                
-            # 打印 Dockerfile 内容
-            print("\n=== Dockerfile 内容 ===")
-            with open(dockerfile_path, 'r') as f:
-                print(f.read())
-                
-            print("\n=== 开始构建过程 ===")
-            image, build_logs = self.docker_client.images.build(
-                path=self.temp_path,
-                rm=True,
-                tag="test_pipeline_image",
-                forcerm=True,  # 强制删除中间容器
-                nocache=True   # 不使用缓存
-            )
-            
-            print("\n=== 构建日志 ===")
-            for log in build_logs:
-                if 'stream' in log:
-                    print(log['stream'].strip())
-                    if get_test_status_from_stdout(log.get('stream')):
-                        self.results.append(get_test_status_from_stdout(log.get('stream')))
-                elif 'error' in log:
-                    print(f"错误: {log['error']}")
-                elif 'status' in log:
-                    print(f"状态: {log['status']}")
-                else:
-                    print(f"其他日志: {log}")
-                    
-            print(f"\n=== 镜像构建成功 ===")
-            print(f"镜像标签: {image.tags[0]}")
-            print(f"镜像ID: {image.id}")
-            
-            return image.tags[0]
-            
-        except docker.errors.BuildError as e:
-            print(f"\n=== 构建失败 ===")
-            print(f"错误类型: {type(e).__name__}")
-            print(f"错误信息: {str(e)}")
-            print("\n详细错误日志:")
-            if hasattr(e, 'build_log'):
-                for log in e.build_log:
-                    print(log)
-                    if 'stream' in log:
-                        print(log['stream'].strip())
-
-                        if get_test_status_from_stdout(log.get('stream')):
-                            self.results.append(get_test_status_from_stdout(log.get('stream')))
-
-            
+            with open(dockerfile_path, 'r',encoding='utf-8') as f:
+                dockerfile_content = f.read()
+            self.logger.info("\n=== Dockerfile 内容 ===\n" + dockerfile_content)
+            self.logger.info("\n=== 开始构建过程 ===")
+            command = ["docker", "build", "-t", "test_pipeline_image", self.temp_path]
+            self.logger.info("执行命令: " + " ".join(command))
+            process = subprocess.Popen(command,encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if "error" in line.lower():
+                        self.logger.error(f"[{timestamp}] {line}")
+                    else:
+                        self.logger.info(f"[{timestamp}] {line}")
+            process.wait()
+            if process.returncode != 0:
+                self.logger.error(f"Docker build 失败，退出码：{process.returncode}")
+                raise Exception("Docker build failed")
+            self.logger.info("=== 镜像构建成功 ===")
+            return "test_pipeline_image"
         except Exception as e:
-            print(f"\n=== 意外错误 ===")
-            print(f"错误类型: {type(e).__name__}")
-            print(f"错误信息: {str(e)}")
-            print(f"堆栈跟踪:\n{traceback.format_exc()}")
+            self.logger.error("构建 Docker 镜像过程中出现异常: " + str(e))
+            raise
+
+    def docker_run_and_get_output(self):
+        try:
+            image_tag = self.build_docker_image()
+            self.logger.info("\n=== 开始运行 Docker 容器 ===")
+            command = ["docker", "run", image_tag]
+            self.logger.info("执行命令: " + " ".join(command))
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.logger.info(f"[{timestamp}] {line}")
+                    self.output_lines.append(line)
+            process.wait()
+            exit_code = process.returncode
+            self.logger.info(f"容器退出，退出码：{exit_code}")
+            return "\n".join(self.output_lines)
+        except Exception as e:
+            self.logger.error("运行 Docker 容器过程中出现异常: " + str(e))
             raise
 
     def run(self):
-        # Step 1: Copy the folder to temp location
         self.copy_project_to_temp()
-
-        # Step 2: Clear the test files
         self.clear_test_files()
-
-        # Step 3: Get directory tree and call AI to complete tests
         ai_generated_tests = self.call_ai_to_complete_tests()
-
-        # Step 4: Write the generated tests
         self.write_completed_tests(ai_generated_tests)
 
-        # Step 5: Docker build and run
         try:
             docker_output = self.docker_run_and_get_output()
+            results = []
+            for line in docker_output.split('\n'):
+                result = get_test_status_from_stdout(line)
+                if result is not None:
+                    results.append(result)
+
+            if results:
+                self.results = results[-1]  
+                self.logger.info(f"Final test result: {self.results}")
+            else:
+                self.results = (-1, -1)
         except Exception as e:
-            print(f"Failed to run Docker: {e}")
+            self.results = (-1, -1)
+            self.logger.error(f"Failed to run Docker: {e}")
             return 1
-        print("Docker Output:", docker_output)
+        
+        self.logger.info("Docker Output:\n" + docker_output)
         return 0
 
 
-
-with open(".env", "r") as f:
-    for line in f:
-        key, value = line.strip().split("=")
-        os.environ[key] = value
-# Example usage
-if __name__ == "__main__":
-
-    base_url = "https://api.siliconflow.cn/v1"
-    api_key = os.getenv("API_KEY")
-    task = Task(project_path="./java_playground/gennemsnit_calculator", base_url=base_url, api_key=api_key,model="Qwen/Qwen2.5-Coder-7B-Instruct", tpm_limit=90000, rpm_limit=300)
+def run_task(project_name, base_url, api_key, model_name, results):
+    task = Task(project_path=f"./java_playground/{project_name}",
+                base_url=base_url, api_key=api_key,
+                model=model_name, tpm_limit=90000, rpm_limit=300, project_name=project_name)
     all_runs = []
-    for i in range(3):
+    for _ in range(5):
         task.run()
         all_runs.append(task.results)
-    with open("all_runs.txt", "w") as f:
-        f.write("Qwen/Qwen2.5-Coder-7B-Instruct\n")
-        f.write(str(all_runs))
+    results[project_name] = all_runs
+
+
+if __name__ == "__main__":
+    # 从 .env 文件读取环境变量
+    with open(".env", "r") as f:
+        for line in f:
+            key, value = line.strip().split("=")
+            os.environ[key] = value
+    
+    base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key = os.getenv("API_KEY")
+    model_name = "llama3.3-70b-instruct"
+    
+    # 允许用户选择多个文件夹
+    project_names  = [
+    "rails_filter_project",
+    "basho_corrected",
+    "extract_Content",
+    "gennemsnit_calculator", 
+    "react_app_fixed_jsdom",
+    "roman_conversion",
+    "text_formatter_final"
+]
+    #project_names = ["rails_filter_project", "extract_Content"]
+    threads = []
+    results = {}
+    
+    for project_name in project_names:
+        thread = threading.Thread(target=run_task, args=(project_name, base_url, api_key, model_name, results))
+        threads.append(thread)
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
+    
+    # 输出所有结果
+    output_file = f"{model_name.replace('/', '_')}_results.txt"
+    with open(output_file, "w") as f:
+        f.write(f"{model_name}\n")
+        f.write(str(results))

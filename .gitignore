@@ -4,3 +4,6 @@ tests/
 java_playground/
 .env
 washed_data/
+*.log
+*.json
+*.jsonl

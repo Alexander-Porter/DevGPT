@@ -55,4 +55,4 @@ def json_to_markdown(json_file, output_file):
     print(f"Items with most possible source code: {has_most_possible_src_code}")
 
 if __name__ == '__main__':
-    json_to_markdown('top_15_final_complex_code.json', 'candidates.md')
+    json_to_markdown('cleaned_data.json', 'candidates.md')

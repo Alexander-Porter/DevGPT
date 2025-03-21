@@ -1,3 +1,6 @@
+import re
+
+
 def get_code_from_md_code_block(content: str) -> str:
     """
     Extract code from markdown code block.
@@ -39,32 +42,40 @@ test("displays email response when requestSent is false and emailResponse is not
     print(get_code_from_md_code_block(test_content))  # def test_function():\n    print("Hello, world!")
 
 
-def get_test_status_from_stdout(stdout: str) -> str:
-    """
-    Get test status from stdout.
-    """
-    #looks like "Tests:       2 failed, 2 total" use regex to extract the number of failed and total tests
-    #or 1 failed, 3 passed, 4 total
-    import re
-    pattern = re.compile(r"Tests:\s+(\d+)\s+failed,\s+(\d+)\s+total")
-    match = pattern.search(stdout)
+def get_test_status_from_stdout(stdout):
+    if not stdout:
+        return None
+        
+    # 格式1: "Tests: X failed, Y total"
+    pattern1 = r'Tests:\s*(\d+)\s*failed,\s*(\d+)\s*total'
+    match = re.search(pattern1, stdout)
     if match:
-        failed = int(match.group(1))
-        total = int(match.group(2))
+        return (int(match.group(1)), int(match.group(2)))
+    
+    # 格式2: "X failed, Y passed, Z total"
+    pattern2 = r'(\d+)\s*failed,\s*(\d+)\s*passed,\s*(\d+)\s*total'
+    match = re.search(pattern2, stdout)
+    if match:
+        return (int(match.group(1)), int(match.group(3)))
+
+    # 格式3: "Tests run: X, Failures: Y, Errors: Z, Skipped: W"
+    pattern3 = r'Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)'
+    match = re.search(pattern3, stdout)
+    if match:
+        failed = int(match.group(2)) + int(match.group(3))  # 失败数 = Failures + Errors
+        total = int(match.group(1))
         return (failed, total)
-    pattern2 = re.compile(r"(\d+)\s+failed,\s+(\d+)\s+passed,\s+(\d+)\s+total")
-    match2 = pattern2.search(stdout)
-    if match2:
-        failed = int(match2.group(1))
-        total = int(match2.group(3))
+    
+    # 格式4: "X examples, Y failures"
+    pattern4 = r'(\d+)\s*examples?,\s*(\d+)\s*failures?'
+    match = re.search(pattern4, stdout)
+    if match:
+        total = int(match.group(1))
+        failed = int(match.group(2))
         return (failed, total)
-    pattern3 = re.compile(r"(\d+)\s+passed,\s+(\d+)\s+total")
-    match3 = pattern3.search(stdout)
-    if match3:
-        failed = 0
-        total = int(match3.group(2))
-        return (failed, total)
+        
+    return None
 
 if __name__ == '__main__':
-    test_stdout = "Tests:       2 failed, 2 total"
+    test_stdout = "Tests run: 2, Failures: 0, Errors: 0, Skipped: 0"
     print(get_test_status_from_stdout(test_stdout))  # (2, 2)
